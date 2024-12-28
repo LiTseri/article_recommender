@@ -1,2 +1,2 @@
 # article_recommender
-Recommend articles from your newsletters subscriptions in your gmail
+AI agent to recommend you articles from your newsletters subscriptions in your gmail
