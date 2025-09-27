@@ -172,3 +172,17 @@ cython_debug/
 
 # Credentials file
 credentials.json
+
+# Virtual env
+venv/
+
+# Secrets
+secrets/
+credentials.json
+token.json
+
+# Environments
+.env
+
+# Output
+output/
