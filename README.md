@@ -99,7 +99,6 @@ OPENAI_API_KEY_PATH=secrets/openai_key.txt
 
 DRY_RUN=0
 
-
 SUMMARY_MODEL=gpt-4o-mini
 
 SUMMARY_FALLBACK_MODEL=gpt-4o-mini
