@@ -90,13 +90,20 @@ credentials.json → Gmail OAuth Desktop credentials
 openai_key.txt → your OpenAI API key (plain text)
 
 5️⃣ Create .env
+
 GMAIL_CREDENTIALS_PATH=secrets/credentials.json
+
 GMAIL_TOKEN_PATH=secrets/token.json
+
 OPENAI_API_KEY_PATH=secrets/openai_key.txt
+
 DRY_RUN=0
 
+
 SUMMARY_MODEL=gpt-4o-mini
+
 SUMMARY_FALLBACK_MODEL=gpt-4o-mini
+
 
 ▶️ Run the Agent
 python src/recommender.py
