@@ -2,276 +2,511 @@ import os
 import re
 import base64
 import datetime as dt
-from typing import List, Tuple, Dict
+from typing import List, Dict, Tuple
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-import requests
-from bs4 import BeautifulSoup
-from time import sleep
+from openai import OpenAI
+import numpy as np
 
-# === Config / Debug switches ===
+
+# =========================
+# ENV + CONFIG
+# =========================
 load_dotenv()
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
 CREDENTIALS_PATH = os.getenv("GMAIL_CREDENTIALS_PATH", "secrets/credentials.json")
-TOKEN_PATH       = os.getenv("GMAIL_TOKEN_PATH",        "secrets/token.json")
+TOKEN_PATH = os.getenv("GMAIL_TOKEN_PATH", "secrets/token.json")
+OPENAI_API_KEY_PATH = os.getenv("OPENAI_API_KEY_PATH", "secrets/openai_key.txt")
 
-# limits (ώστε να μη σέρνεται)
-LIMIT_EMAILS    = int(os.getenv("LIMIT_EMAILS", "25"))   # πόσα emails max
-LIMIT_LINKS     = int(os.getenv("LIMIT_LINKS", "40"))    # πόσα links max (πριν το κατέβασμα)
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "6")) # δευτερόλεπτα ανά σελίδα
+# keep both naming styles supported
+SUMMARY_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", os.getenv("SUMMARY_MODEL", "gpt-4o-mini"))
+SUMMARY_FALLBACK_MODEL = os.getenv("OPENAI_SUMMARY_FALLBACK_MODEL", os.getenv("SUMMARY_FALLBACK_MODEL", "gpt-4o-mini"))
+EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", os.getenv("EMBED_MODEL", "text-embedding-3-small"))
+
+DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in ("1", "true", "yes")
+
+LIMIT_EMAILS = int(os.getenv("LIMIT_EMAILS", "25"))
+LIMIT_LINKS = int(os.getenv("LIMIT_LINKS", "120"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+
+MAX_ARTICLES = int(os.getenv("MAX_ARTICLES", "12"))
+EXCERPT_CHARS = int(os.getenv("MAX_EXCERPT_CHARS", "2200"))
+SUMMARY_TOKENS = int(os.getenv("MAX_SUMMARY_TOKENS", "260"))
+BUDGET = float(os.getenv("BUDGET", "0.10"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ArticleRecommender/1.0)"}
 URL_REGEX = re.compile(r'https?://[^\s<>\)\("]+')
 
-SKIP_HOSTS = {
-    # static assets / CDNs / fonts / images / tracking
-    "fonts.gstatic.com", "fonts.googleapis.com", "static-assets", "cdn.",
-    "media.beehiiv.com", "static_assets", "gstatic.com", "doubleclick.net",
-    "facebook.com", "instagram.com", "tiktok.com", "twitter.com", "x.com",
-    "mailto:", "accounts.google.com", "support.google", "google.com/mail"
-}
-SKIP_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
-             ".woff", ".woff2", ".ttf", ".otf", ".css", ".js", ".mp4", ".mov"}
 
+# =========================
+# NOISE FILTERING (strong but fair)
+# =========================
+SKIP_HOSTS = {
+    "fonts.gstatic.com", "fonts.googleapis.com",
+    "media.beehiiv.com", "gstatic.com",
+    "doubleclick.net",
+}
+SKIP_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
+    ".woff", ".woff2", ".ttf", ".otf",
+    ".css", ".js", ".mp4", ".mov",
+}
+
+NOISE_URL_SUBSTRINGS = [
+    "book-a-call", "demo", "pricing", "subscribe", "preferences",
+    "media-kit", "mediakit", "sponsor", "advertis", "partners",
+    "utm_", "ref=", "signup", "register", "/careers", "/jobs",
+    "tiktok.com", "x.com/", "twitter.com/", "instagram.com/",
+    "passionfroot.me", "link.courses.maven.com",
+]
+
+CONTENT_HINTS = [
+    "/p/", "/post/", "/posts/", "/blog/", "/article/", "/news/",
+    "/202", "substack.com", "medium.com", "archive.", "marktechpost",
+    "towardsdatascience", "hbr.org", "arxiv.org", "github.com",
+]
+
+def looks_like_asset(url: str) -> bool:
+    u = (url or "").lower()
+    return any(u.endswith(ext) for ext in SKIP_EXTS)
+
+def host_is_skipped(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+        return host in SKIP_HOSTS
+    except Exception:
+        return False
+
+def is_noise_url(url: str) -> bool:
+    if not url:
+        return True
+    u = url.lower()
+    if host_is_skipped(url) or looks_like_asset(url):
+        return True
+    if any(s in u for s in NOISE_URL_SUBSTRINGS):
+        return True
+    if u.rstrip("/") in ("https://x.com", "https://twitter.com", "https://tiktok.com"):
+        return True
+    return False
+
+def prefer_content_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(h in u for h in CONTENT_HINTS)
+
+
+# =========================
+# OPENAI CLIENT
+# =========================
+def get_openai_client() -> OpenAI:
+    if not OPENAI_API_KEY_PATH or not os.path.exists(OPENAI_API_KEY_PATH):
+        raise RuntimeError("Missing OPENAI_API_KEY_PATH or file not found (secrets/openai_key.txt).")
+    key = open(OPENAI_API_KEY_PATH, "r", encoding="utf-8").read().strip()
+    return OpenAI(api_key=key)
+
+
+# =========================
+# GMAIL AUTH
+# =========================
 def get_gmail_service():
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=8080)
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
+
+        os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
+        with open(TOKEN_PATH, "w", encoding="utf-8") as token:
+            token.write(creds.to_json())
+
     return build("gmail", "v1", credentials=creds)
 
-def build_query(labels, start_date, end_date) -> str:
-    parts = []
-    for lab in labels:
-        lab = lab.strip()
-        if lab:
-            parts.append(f'label:"{lab}"')
-    if start_date:
-        parts.append(f"after:{start_date}")   # YYYY/MM/DD
-    if end_date:
-        parts.append(f"before:{end_date}")    # YYYY/MM/DD
-    return " ".join(parts).strip()
 
-def _decode_body(data_b64: str) -> str:
+# =========================
+# Gmail helpers
+# =========================
+def _header(payload: dict, name: str) -> str:
+    for h in payload.get("headers", []) or []:
+        if (h.get("name") or "").lower() == name.lower():
+            return h.get("value") or ""
+    return ""
+
+def _internal_date_to_iso(msg: dict) -> str:
     try:
-        return base64.urlsafe_b64decode(data_b64.encode("utf-8")).decode("utf-8", errors="ignore")
+        ms = int(msg.get("internalDate", "0"))
+        d = dt.datetime.utcfromtimestamp(ms / 1000.0).date()
+        return d.isoformat()
     except Exception:
         return ""
 
-def extract_email_body(msg: Dict) -> Tuple[str, str]:
-    payload = msg.get("payload", {})
-    parts = payload.get("parts")
-    body_plain, body_html = "", ""
-
-    def walk(p):
-        nonlocal body_plain, body_html
-        if "parts" in p:
-            for sub in p["parts"]:
-                walk(sub)
-        else:
+def _decode_html_part(payload: dict) -> str:
+    def walk(parts):
+        for p in parts or []:
             mime = p.get("mimeType", "")
-            data = p.get("body", {}).get("data")
-            if data:
-                text = _decode_body(data)
-                if "text/plain" in mime:
-                    body_plain += text + "\n"
-                elif "text/html" in mime:
-                    body_html += text + "\n"
+            if mime in ("text/html", "text/plain"):
+                data = (p.get("body", {}) or {}).get("data")
+                if data:
+                    try:
+                        return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                    except Exception:
+                        pass
+            inner = p.get("parts")
+            if inner:
+                got = walk(inner)
+                if got:
+                    return got
+        return ""
 
-    if parts:
-        walk(payload)
-    else:
-        data = payload.get("body", {}).get("data")
+    if payload.get("mimeType") in ("text/html", "text/plain"):
+        data = (payload.get("body", {}) or {}).get("data")
         if data:
-            mime = payload.get("mimeType", "")
-            text = _decode_body(data)
-            if "text/html" in mime:
-                body_html += text
-            else:
-                body_plain += text
+            try:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            except Exception:
+                pass
 
-    return body_plain, body_html
+    return walk(payload.get("parts", []))
 
-def is_probably_article(url: str) -> bool:
-    low = url.lower()
-    # extensions
-    if any(low.endswith(ext) for ext in SKIP_EXTS):
-        return False
-    # hosts/patterns
-    if any(h in low for h in SKIP_HOSTS):
-        return False
-    # very short urls usually aren't articles
-    if len(url) < 15:
-        return False
-    return True
+def read_email_and_links(service, msg_id: str) -> Tuple[Dict, List[str]]:
+    msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    payload = msg.get("payload", {}) or {}
 
-def extract_links(text: str):
-    if not text:
-        return []
-    urls = URL_REGEX.findall(text)
-    cleaned = []
-    for u in urls:
-        u = u.rstrip(").,;\"'")
-        if not is_probably_article(u):
-            continue
-        cleaned.append(u)
-    # unique preserve order
-    seen, out = set(), []
-    for u in cleaned:
+    subject = _header(payload, "Subject").strip() or "(no subject)"
+    date_iso = _internal_date_to_iso(msg) or ""
+    from_ = _header(payload, "From").strip()
+
+    body = _decode_html_part(payload) or ""
+    links = URL_REGEX.findall(body)
+
+    uniq = []
+    seen = set()
+    for u in links:
         if u not in seen:
             seen.add(u)
-            out.append(u)
-    return out
+            uniq.append(u)
 
-def fetch_page_info(url: str):
+    email_meta = {
+        "id": msg_id,
+        "subject": subject,
+        "date": date_iso,
+        "from": from_,
+        "body": body,
+    }
+    return email_meta, uniq
+
+
+# =========================
+# URL resolve
+# =========================
+def resolve_url(url: str) -> str:
+    try:
+        r = requests.head(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if r.url:
+            return r.url
+    except Exception:
+        pass
     try:
         r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        ct = r.headers.get("Content-Type", "").lower()
-        if "text/html" not in ct:
-            return "", "", 0
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        meta_title = soup.find("meta", property="og:title")
-        title = (meta_title.get("content") if meta_title and meta_title.has_attr("content")
-                 else (soup.title.string if soup.title else "")).strip()
-        desc_tag = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", property="og:description")
-        desc = desc_tag.get("content").strip() if desc_tag and desc_tag.has_attr("content") else ""
-        text_len = len(soup.get_text(separator=" ", strip=True))
-        return title, desc, text_len
+        return r.url or url
     except Exception:
-        return "", "", 0
+        return url
 
-def score_article(title: str, desc: str, text_len: int, keywords):
-    # απλή βαθμολόγηση
-    t, d = title.lower(), desc.lower()
-    score = 0.0
-    for kw in keywords:
-        k = kw.strip().lower()
-        if not k:
-            continue
-        if k in t:
-            score += 2
-        if k in d:
-            score += 1
-    score += min(text_len / 4000.0, 2.0)
-    return score
 
-def main():
-    print("=== Gmail Article Recommender (clean fetch) ===")
-    print(f"[Config] LIMIT_EMAILS={LIMIT_EMAILS}, LIMIT_LINKS={LIMIT_LINKS}, REQUEST_TIMEOUT={REQUEST_TIMEOUT}s")
-    labels = [x.strip() for x in input("Labels (π.χ. Newsletters,AI): ").split(",") if x.strip()] or ["Newsletters"]
-    start_date = input("Αρχική ημερομηνία (YYYY/MM/DD): ").strip()
-    end_date   = input("Τελική ημερομηνία (YYYY/MM/DD): ").strip()
-    keywords   = [x.strip() for x in input("Λέξεις-κλειδιά (AI,LLM,...): ").split(",") if x.strip()]
+# =========================
+# Web fetch
+# =========================
+def fetch_page_text(url: str) -> Tuple[str, str]:
     try:
-        top_k = int(input("Πόσα άρθρα (π.χ. 5): ").strip() or "5")
-    except:
-        top_k = 5
+        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        title = soup.title.string.strip() if soup.title and soup.title.string else "(no title)"
+        text = soup.get_text(separator=" ", strip=True)
+        return title, (text or "")[:EXCERPT_CHARS]
+    except Exception:
+        return "(no title)", ""
+
+
+# =========================
+# Embeddings + ranking
+# =========================
+def cosine_sim(a, b) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+def rank_candidates(client: OpenAI, candidates: List[Dict], query_text: str) -> List[Dict]:
+    if not query_text.strip():
+        for c in candidates:
+            c["similarity"] = 0.0
+            c["heur_score"] = (1 if prefer_content_url(c["url"]) else 0) * 100000 + len(c.get("excerpt", ""))
+        return sorted(candidates, key=lambda x: x.get("heur_score", 0), reverse=True)
+
+    texts = [query_text] + [c["title"] + "\n" + c["excerpt"] for c in candidates]
+    emb = client.embeddings.create(model=EMBED_MODEL, input=texts)
+    vecs = [d.embedding for d in emb.data]
+    qv = vecs[0]
+
+    for i, c in enumerate(candidates):
+        c["similarity"] = cosine_sim(qv, vecs[i + 1])
+
+    return sorted(candidates, key=lambda x: x["similarity"], reverse=True)
+
+
+# =========================
+# Diversity selection (NEW!)
+# 1 per email όσο γίνεται, αλλιώς fill with next best
+# =========================
+def select_with_diversity(ranked: List[Dict], top_n: int) -> List[Dict]:
+    if top_n <= 0:
+        return []
+
+    selected: List[Dict] = []
+    used_emails = set()
+
+    # Pass 1: pick best from distinct emails
+    for c in ranked:
+        eid = c.get("email_id")
+        if eid and eid not in used_emails:
+            selected.append(c)
+            used_emails.add(eid)
+            if len(selected) >= top_n:
+                return selected
+
+    # Pass 2: fill remaining with next best overall (can repeat emails)
+    for c in ranked:
+        if c in selected:
+            continue
+        selected.append(c)
+        if len(selected) >= top_n:
+            break
+
+    return selected
+
+
+# =========================
+# Summaries
+# =========================
+def generate_summary(client: OpenAI, title: str, url: str, excerpt: str) -> str:
+    prompt = (
+        "You are summarizing ONE specific article from a newsletter.\n"
+        "Return ONLY this markdown structure, in English:\n\n"
+        "### Key Points:\n"
+        "- (3 bullets)\n\n"
+        "### Why It Matters:\n"
+        "(1-2 sentences)\n\n"
+        f"Article Title: {title}\n"
+        f"Article URL: {url}\n\n"
+        f"Content:\n{excerpt}"
+    )
+
+    if DRY_RUN:
+        return "### Key Points:\n- (DRY_RUN)\n- (No API call)\n- \n\n### Why It Matters:\n(DRY_RUN)\n"
+
+    resp = client.responses.create(
+        model=SUMMARY_MODEL,
+        input=[{"role": "user", "content": prompt}],
+        max_output_tokens=SUMMARY_TOKENS,
+    )
+    txt = (resp.output_text or "").strip()
+    if txt:
+        return txt
+
+    resp2 = client.responses.create(
+        model=SUMMARY_FALLBACK_MODEL,
+        input=[{"role": "user", "content": prompt}],
+        max_output_tokens=SUMMARY_TOKENS,
+    )
+    txt2 = (resp2.output_text or "").strip()
+    return txt2 if txt2 else "_(Summary unavailable — model returned empty output.)_"
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    print("=== Gmail Article Recommender (Grouped by Email + Diversity 1/email) ===")
+    print(f"[Config] LIMIT_EMAILS={LIMIT_EMAILS}, LIMIT_LINKS={LIMIT_LINKS}, TIMEOUT={REQUEST_TIMEOUT}s")
+    print(f"[Models] EMBED={EMBED_MODEL} | SUMMARY={SUMMARY_MODEL} (fallback={SUMMARY_FALLBACK_MODEL}) | DRY_RUN={DRY_RUN}")
+
+    labels = input("Labels (e.g. InspoNews,Newsletters): ").strip()
+    start = input("Start date (YYYY/MM/DD): ").strip()
+    end = input("End date (YYYY/MM/DD): ").strip()
+
+    keyword = input(
+        "Give me your search keyword (optional). If you want to make the search more specific, type it; otherwise hit Enter: "
+    ).strip()
+
+    top_n_raw = input("How many articles should I recommend (e.g. 5): ").strip()
+    top_n = int(top_n_raw) if top_n_raw.isdigit() else 5
+    top_n = max(1, min(top_n, MAX_ARTICLES))
 
     service = get_gmail_service()
-    query = build_query(labels, start_date, end_date)
-    print(f"\n[1/4] Ψάχνω με query: {query}")
+    client = get_openai_client()
 
-    # IDs
-    ids = []
-    req = service.users().messages().list(userId="me", q=query, maxResults=100)
-    pages = 0
-    while req is not None:
-        resp = req.execute()
-        page_ids = [m["id"] for m in resp.get("messages", [])]
-        ids.extend(page_ids)
-        pages += 1
-        print(f"   - Σελίδα {pages}: +{len(page_ids)} ids (σύνολο {len(ids)})")
-        if len(ids) >= LIMIT_EMAILS:
-            print(f"   - Έπιασα το όριο {LIMIT_EMAILS} emails. Σταματάω.")
-            break
-        req = service.users().messages().list_next(previous_request=req, previous_response=resp)
+    gmail_query = f'label:"{labels}" after:{start} before:{end}'
+    print(f"\n[1/5] Gmail query: {gmail_query}")
 
-    ids = ids[:LIMIT_EMAILS]
-    if not ids:
-        print("   → Δεν βρέθηκαν μηνύματα. Έλεγξε σωστή ορθογραφία label/ημερομηνίες.")
+    results = service.users().messages().list(userId="me", q=gmail_query, maxResults=LIMIT_EMAILS).execute()
+    msg_ids = [m["id"] for m in (results.get("messages") or [])]
+    if not msg_ids:
+        print("No emails found for that label/date range.")
         return
 
-    # Bodies & links
-    print(f"\n[2/4] Διαβάζω {len(ids)} μηνύματα & εξάγω links…")
-    all_links = []
-    for i, mid in enumerate(ids, 1):
-        if i % 5 == 0 or i == len(ids):
-            print(f"   - Προχώρησα {i}/{len(ids)} μηνύματα…")
-        msg = service.users().messages().get(userId="me", id=mid, format="full").execute()
-        body_txt, body_html = extract_email_body(msg)
-        links = set(extract_links(body_txt) + extract_links(body_html))
-        all_links.extend(list(links))
+    print(f"\n[2/5] Reading {min(LIMIT_EMAILS, len(msg_ids))} emails & extracting links…")
 
-    # unique & limit
-    unique_links, seen = [], set()
-    for u in all_links:
-        if u not in seen:
-            seen.add(u)
-            unique_links.append(u)
-    if not unique_links:
-        print("   → Δεν βρέθηκαν χρήσιμα links στα emails.")
+    emails_by_id: Dict[str, Dict] = {}
+    candidates: List[Dict] = []
+    global_seen_urls = set()
+
+    for i, msg_id in enumerate(msg_ids[:LIMIT_EMAILS], 1):
+        email_meta, links = read_email_and_links(service, msg_id)
+        emails_by_id[msg_id] = email_meta
+
+        for raw_url in links:
+            if len(candidates) >= LIMIT_LINKS:
+                break
+            if is_noise_url(raw_url):
+                continue
+
+            final_url = resolve_url(raw_url)
+            if is_noise_url(final_url):
+                continue
+
+            # global dedup
+            if final_url in global_seen_urls:
+                continue
+            global_seen_urls.add(final_url)
+
+            title, excerpt = fetch_page_text(final_url)
+            source = "web"
+
+            if not excerpt.strip():
+                excerpt = (email_meta.get("body") or "")[:EXCERPT_CHARS]
+                source = "email"
+
+            if not excerpt.strip():
+                continue
+
+            if (title or "").strip() in ("", "(no title)"):
+                title = "(no title) — from email: " + email_meta.get("subject", "(no subject)")
+
+            candidates.append({
+                "url": final_url,
+                "title": title,
+                "excerpt": excerpt,
+                "source": source,
+
+                "email_id": msg_id,
+                "email_subject": email_meta["subject"],
+                "email_date": email_meta["date"],
+                "email_from": email_meta["from"],
+            })
+
+        if i % 5 == 0:
+            print(f"   - {i}/{min(LIMIT_EMAILS, len(msg_ids))} emails processed")
+
+    print(f"   - Candidate articles collected: {len(candidates)}")
+    if not candidates:
+        print("No usable candidates (filters removed everything). Try widening date range.")
         return
-    if len(unique_links) > LIMIT_LINKS:
-        print(f"   - Πολλά links ({len(unique_links)}). Κρατάω τα πρώτα {LIMIT_LINKS}.")
-        unique_links = unique_links[:LIMIT_LINKS]
 
-    print(f"   - Θα αξιολογήσω {len(unique_links)} links…")
-
-    # Fetch & score
-    print("\n[3/4] Κατεβάζω σελίδες & δίνω score…")
-    scored = []
-    for i, url in enumerate(unique_links, 1):
-        if i % 5 == 0 or i == len(unique_links):
-            print(f"   - {i}/{len(unique_links)}…")
-        title, desc, text_len = fetch_page_info(url)
-        if not title and not desc and text_len == 0:
-            continue
-        s = score_article(title, desc, text_len, keywords)
-        scored.append({"url": url, "title": title or "(no title)", "desc": desc, "len": text_len, "score": s})
-        sleep(0.03)
-
-    if not scored:
-        print("   → Δεν μπόρεσα να αξιολογήσω links (ίσως ήταν όλα assets/redirects).")
+    # Cost guard (rough)
+    est = 0.001 + 0.00035 * top_n
+    print(f"\n[Cost guard] Estimated run cost ≈ ${est:.4f} (budget ${BUDGET:.2f})")
+    if est > BUDGET:
+        print("❌ Estimated cost exceeds budget. Reduce top_n or increase BUDGET in .env.")
         return
 
-    # Sort & report
-    print("\n[4/4] Ταξινόμηση & αναφορά…")
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top = scored[:top_k]
+    print("\n[3/5] Semantic ranking…")
+    ranked_all = rank_candidates(client, candidates, keyword)
 
-    print("\n--- Προτεινόμενα άρθρα ---")
-    for i, it in enumerate(top, 1):
-        print(f"{i}. {it['title']}\n   {it['url']}\n   score={it['score']:.2f}  len≈{it['len']}\n")
+    # NEW: diversity selection
+    ranked = select_with_diversity(ranked_all, top_n)
 
+    print(f"\n[4/5] Generating summaries for top-{len(ranked)} (diverse) …")
+    for idx, c in enumerate(ranked, 1):
+        c["summary"] = generate_summary(client, c["title"], c["url"], c["excerpt"])
+        print(f"   - {idx}/{len(ranked)} done")
+
+    # Group results by email (for output clarity)
+    grouped: Dict[str, List[Dict]] = {}
+    for c in ranked:
+        grouped.setdefault(c["email_id"], []).append(c)
+
+    # Order email groups by appearance in ranked list
+    email_order = []
+    seen = set()
+    for c in ranked:
+        eid = c["email_id"]
+        if eid not in seen:
+            seen.add(eid)
+            email_order.append(eid)
+
+    print("\n[5/5] Writing markdown output…")
     today = dt.date.today().isoformat()
     os.makedirs("output", exist_ok=True)
-    report_path = os.path.join("output", f"daily_digest_{today}.md")
-    with open(report_path, "w", encoding="utf-8") as f:
+    out_path = f"output/daily_digest_{today}.md"
+
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"# Daily Digest ({today})\n\n")
-        f.write(f"**Labels:** {', '.join(labels)}  |  **Ημερομηνίες:** {start_date or '-'} → {end_date or '-'}\n\n")
-        if keywords:
-            f.write(f"**Λέξεις-κλειδιά:** {', '.join(keywords)}\n\n")
-        for i, it in enumerate(top, 1):
-            f.write(f"{i}. [{it['title']}]({it['url']})\n")
-            if it['desc']:
-                f.write(f"   {it['desc']}\n")
-            f.write(f"   _score={it['score']:.2f}, len≈{it['len']}_\n\n")
-    print(f"Αποθηκεύτηκε: {report_path}\n✅ Έτοιμο!")
-    
+        f.write(f"**Labels:** {labels}  |  **Dates:** {start} → {end}\n\n")
+        f.write(f"**Search keyword (optional):** {keyword if keyword else '(none)'}\n\n")
+        f.write(f"**Embedding model:** `{EMBED_MODEL}` | **Summary model:** `{SUMMARY_MODEL}`\n\n")
+        f.write(f"**Mode:** Grouped by Email ✅ | **Diversity:** 1 article per email (as much as possible) ✅\n\n")
+        f.write("---\n\n")
+
+        f.write("## Top Picks (quick view)\n\n")
+        for i, c in enumerate(ranked, 1):
+            f.write(
+                f"{i}. **{c['title']}**  \n"
+                f"   - Article: {c['url']}  \n"
+                f"   - From email: **{c['email_subject']}** ({c['email_date'] or 'unknown date'})\n\n"
+            )
+
+        f.write("---\n\n")
+        f.write("## Picks grouped by Email\n\n")
+
+        email_counter = 1
+        for eid in email_order:
+            meta = emails_by_id.get(eid, {})
+            subj = meta.get("subject", "(no subject)")
+            date_iso = meta.get("date", "(unknown)")
+            sender = meta.get("from", "")
+
+            f.write(f"### Email {email_counter}: {subj}\n")
+            f.write(f"- **Date:** {date_iso}\n")
+            if sender:
+                f.write(f"- **Sender:** {sender}\n")
+            f.write("\n")
+
+            for j, c in enumerate(grouped.get(eid, []), 1):
+                f.write(f"#### {email_counter}.{j} Article: {c['title']}\n")
+                f.write(f"- URL: {c['url']}\n")
+                if keyword.strip():
+                    f.write(f"- Similarity: {c.get('similarity', 0.0):.4f}\n")
+                f.write(f"- Excerpt source: {c.get('source','web')}\n\n")
+                f.write(c["summary"].strip() + "\n\n")
+
+            f.write("---\n\n")
+            email_counter += 1
+
+    print(f"✅ Done! Saved: {out_path}")
+
 
 if __name__ == "__main__":
     main()
